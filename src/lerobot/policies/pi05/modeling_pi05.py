@@ -586,8 +586,25 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
             train_expert_only=config.train_expert_only,
         )
 
-        self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
-        self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
+        if config.use_task_adapter:
+            # Task Adapter: Non-linear interface (Exp2)
+            # action(32) → Linear(32→32) → GELU → Linear(32→1024) → token
+            self.action_in_proj = nn.Sequential(
+                nn.Linear(config.max_action_dim, config.max_action_dim),
+                nn.GELU(),
+                nn.Linear(config.max_action_dim, action_expert_config.width),
+            )
+            self.action_out_proj = nn.Sequential(
+                nn.Linear(action_expert_config.width, config.max_action_dim),
+                nn.GELU(),
+                nn.Linear(config.max_action_dim, config.max_action_dim),
+            )
+        else:
+            self.action_in_proj = nn.Linear(config.max_action_dim, action_expert_config.width)
+            self.action_out_proj = nn.Linear(action_expert_config.width, config.max_action_dim)
+
+        # Store the output dimension of action_in_proj for time embedding
+        self.action_in_proj_out_features = action_expert_config.width
 
         self.time_mlp_in = nn.Linear(action_expert_config.width, action_expert_config.width)
         self.time_mlp_out = nn.Linear(action_expert_config.width, action_expert_config.width)
@@ -701,7 +718,7 @@ class PI05Pytorch(nn.Module):  # see openpi `PI0Pytorch`
         # Embed timestep using sine-cosine positional encoding
         time_emb = create_sinusoidal_pos_embedding(
             timestep,
-            self.action_in_proj.out_features,
+            self.action_in_proj_out_features,
             min_period=self.config.min_period,
             max_period=self.config.max_period,
             device=timestep.device,
@@ -1120,8 +1137,29 @@ class PI05Policy(PreTrainedPolicy):
 
         return fixed_state_dict
 
-    def get_optim_params(self) -> dict:
-        return self.parameters()
+    def get_optim_params(self):
+        """Return optimizer parameter groups with optional layer-wise learning rates.
+
+        When use_task_adapter is True, adapter parameters use adapter_lr while
+        other expert parameters use expert_lr for fine-grained control.
+        """
+        if not self.config.use_task_adapter:
+            return self.parameters()
+
+        # Layer-wise learning rates for Task Adapter (Exp2)
+        adapter_names = ['action_in_proj', 'action_out_proj']
+        adapter_params, expert_params = [], []
+        for name, param in self.named_parameters():
+            if not param.requires_grad:
+                continue
+            if any(a in name for a in adapter_names):
+                adapter_params.append(param)
+            else:
+                expert_params.append(param)
+        return [
+            {"params": adapter_params, "lr": self.config.adapter_lr},
+            {"params": expert_params, "lr": self.config.expert_lr},
+        ]
 
     def reset(self):
         """Reset internal state - called when environment resets."""
@@ -1276,6 +1314,13 @@ class PI05Policy(PreTrainedPolicy):
         # Truncate losses to actual action dimensions
         original_action_dim = self.config.output_features[ACTION].shape[0]
         losses = losses[:, :, :original_action_dim]
+
+        # Gripper loss weighting (Exp3)
+        # Apply per-dimension weighting to emphasize gripper (last dim of 6-DOF)
+        if self.config.gripper_loss_weight != 1.0:
+            weight = torch.ones(original_action_dim, device=losses.device, dtype=losses.dtype)
+            weight[-1] = self.config.gripper_loss_weight  # Gripper is the last dimension
+            losses = losses * weight.view(1, 1, -1)
 
         loss_dict = {
             "loss_per_dim": losses.mean(dim=[0, 1]).detach().cpu().numpy().tolist(),

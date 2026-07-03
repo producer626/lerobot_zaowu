@@ -84,6 +84,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy_type = None
         self.lerobot_features = None
         self.actions_per_chunk = None
+        self.rename_map: dict[str, str] = {}
         self.policy = None
         self.preprocessor: PolicyProcessorPipeline[dict[str, Any], dict[str, Any]] | None = None
         self.postprocessor: PolicyProcessorPipeline[PolicyAction, PolicyAction] | None = None
@@ -152,17 +153,35 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         self.policy = policy_class.from_pretrained(policy_specs.pretrained_name_or_path)
         self.policy.to(self.device)
 
-        # Load preprocessor and postprocessor, overriding device to match requested device
+        # Load preprocessor and postprocessor, overriding device to match requested device.
+        # Note: We do NOT override rename_observations_processor here. The rename_map comes
+        # from the pretrained model's preprocessor config, which correctly maps robot camera
+        # names (e.g. "front") to policy camera names (e.g. "camera1"). Overriding it with
+        # an empty dict from the client would break the mapping.
         device_override = {"device": self.device}
+        preprocessor_overrides = {"device_processor": device_override}
+        # Only override rename_map if the client explicitly provides a non-empty one
+        if policy_specs.rename_map:
+            preprocessor_overrides["rename_observations_processor"] = {
+                "rename_map": policy_specs.rename_map
+            }
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             self.policy.config,
             pretrained_path=policy_specs.pretrained_name_or_path,
-            preprocessor_overrides={
-                "device_processor": device_override,
-                "rename_observations_processor": {"rename_map": policy_specs.rename_map},
-            },
+            preprocessor_overrides=preprocessor_overrides,
             postprocessor_overrides={"device_processor": device_override},
         )
+
+        # Extract rename_map from the loaded preprocessor for use in raw_observation_to_observation.
+        # The rename_map maps robot observation keys (e.g. "observation.images.front") to policy
+        # keys (e.g. "observation.images.camera1") and is needed because raw_observation_to_observation
+        # runs BEFORE the preprocessor but needs to look up policy_image_features by policy key names.
+        self.rename_map: dict[str, str] = {}
+        for step in self.preprocessor.steps:
+            if hasattr(step, "rename_map"):
+                self.rename_map = step.rename_map
+                self.logger.info(f"Extracted rename_map from preprocessor: {self.rename_map}")
+                break
 
         end = time.perf_counter()
 
@@ -343,6 +362,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
             observation_t.get_observation(),
             self.lerobot_features,
             self.policy_image_features,
+            rename_map=self.rename_map,
         )
         prepare_time = time.perf_counter() - start_prepare
 

@@ -110,7 +110,10 @@ class LeRobotDatasetMetadata:
             self._load_metadata()
         except (FileNotFoundError, NotADirectoryError):
             if is_valid_version(self.revision):
-                self.revision = get_safe_version(self.repo_id, self.revision)
+                try:
+                    self.revision = get_safe_version(self.repo_id, self.revision)
+                except Exception:
+                    self.revision = "main"  # Dataset has no version tags, use default
 
             self._pull_from_repo(allow_patterns="meta/")
             self._load_metadata()

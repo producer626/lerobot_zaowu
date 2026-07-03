@@ -87,6 +87,15 @@ class PI05Config(PreTrainedConfig):
     freeze_vision_encoder: bool = False  # Freeze only the vision encoder
     train_expert_only: bool = False  # Freeze entire VLM, train only action expert and projections
 
+    # Task Adapter: Non-linear interface for action projections (Exp2)
+    use_task_adapter: bool = False  # Use GELU-based non-linear adapter instead of pure linear
+    # Layer-wise learning rates for adapter (only used when use_task_adapter=True)
+    adapter_lr: float = 1e-4  # Learning rate for adapter parameters
+    expert_lr: float = 5e-6  # Learning rate for other expert parameters
+
+    # Gripper loss weighting (Exp3)
+    gripper_loss_weight: float = 1.0  # Weight for gripper dimension loss (>1.0 to emphasize gripper)
+
     # Optimizer settings: see openpi `AdamW`
     optimizer_lr: float = 2.5e-5  # see openpi `CosineDecaySchedule: peak_lr`
     optimizer_betas: tuple[float, float] = (0.9, 0.95)
