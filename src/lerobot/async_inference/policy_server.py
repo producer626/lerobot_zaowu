@@ -162,9 +162,7 @@ class PolicyServer(services_pb2_grpc.AsyncInferenceServicer):
         preprocessor_overrides = {"device_processor": device_override}
         # Only override rename_map if the client explicitly provides a non-empty one
         if policy_specs.rename_map:
-            preprocessor_overrides["rename_observations_processor"] = {
-                "rename_map": policy_specs.rename_map
-            }
+            preprocessor_overrides["rename_observations_processor"] = {"rename_map": policy_specs.rename_map}
         self.preprocessor, self.postprocessor = make_pre_post_processors(
             self.policy.config,
             pretrained_path=policy_specs.pretrained_name_or_path,

@@ -93,7 +93,9 @@ def raw_observation_to_observation(
 ) -> Observation:
     observation = {}
 
-    observation = prepare_raw_observation(raw_observation, lerobot_features, policy_image_features, rename_map)
+    observation = prepare_raw_observation(
+        raw_observation, lerobot_features, policy_image_features, rename_map
+    )
     for k, v in observation.items():
         if isinstance(v, torch.Tensor):  # VLAs present natural-language instructions in observations
             if "image" in k:
