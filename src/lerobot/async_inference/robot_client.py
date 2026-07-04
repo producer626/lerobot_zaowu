@@ -106,6 +106,7 @@ class RobotClient:
             lerobot_features,
             config.actions_per_chunk,
             config.policy_device,
+            rename_map=config.rename_map,
         )
         self.channel = grpc.insecure_channel(
             self.server_address, grpc_channel_options(initial_backoff=f"{config.environment_dt:.4f}s")
@@ -132,13 +133,86 @@ class RobotClient:
 
         self.logger.info("Robot connected and ready")
 
+        # Exponential backoff state for server unavailability
+        self._backoff_until = 0.0  # timestamp until which we should back off
+        self._backoff_duration = 0.0  # current backoff duration in seconds
+
         # Use an event for thread-safe coordination
         self.must_go = threading.Event()
         self.must_go.set()  # Initially set - observations qualify for direct processing
 
+        # Recording setup (only when record_dataset_repo_id is provided)
+        self.dataset = None
+        self._video_encoding_manager = None
+        self._robot_observation_processor = None
+        self._last_obs_processed = None
+        self._listener = None
+        self._events = None
+
+        if config.record_dataset_repo_id is not None:
+            self._setup_recording()
+
     @property
     def running(self):
         return not self.shutdown_event.is_set()
+
+    def _setup_recording(self):
+        """Set up dataset recording using the same flow as lerobot-record."""
+        from lerobot.common.control_utils import init_keyboard_listener
+        from lerobot.datasets import LeRobotDataset
+        from lerobot.datasets.pipeline_features import (
+            aggregate_pipeline_dataset_features,
+            create_initial_features,
+        )
+        from lerobot.datasets.video_utils import VideoEncodingManager
+        from lerobot.processor.factory import make_default_processors
+        from lerobot.utils.constants import ACTION, OBS_STR
+        from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
+
+        # Reuse official processor and feature construction (lerobot_record.py:451-466)
+        teleop_action_processor, robot_action_processor, robot_observation_processor = (
+            make_default_processors()
+        )
+        self._robot_observation_processor = robot_observation_processor
+        self._build_dataset_frame = build_dataset_frame
+        self._OBS_STR = OBS_STR
+        self._ACTION = ACTION
+
+        dataset_features = combine_feature_dicts(
+            aggregate_pipeline_dataset_features(
+                pipeline=teleop_action_processor,
+                initial_features=create_initial_features(action=self.robot.action_features),
+                use_videos=True,
+            ),
+            aggregate_pipeline_dataset_features(
+                pipeline=robot_observation_processor,
+                initial_features=create_initial_features(observation=self.robot.observation_features),
+                use_videos=True,
+            ),
+        )
+
+        # Reuse official dataset creation (lerobot_record.py:491-505)
+        self.dataset = LeRobotDataset.create(
+            repo_id=self.config.record_dataset_repo_id,
+            fps=self.config.fps,
+            root=self.config.record_dataset_root,
+            robot_type=self.robot.name,
+            features=dataset_features,
+            use_videos=True,
+            streaming_encoding=True,
+        )
+
+        self._video_encoding_manager = VideoEncodingManager(self.dataset)
+        self._video_encoding_manager.__enter__()
+
+        # Reuse official keyboard listener (lerobot_record.py:526)
+        self._listener, self._events = init_keyboard_listener()
+
+        self.logger.info(
+            f"Recording enabled: repo_id={self.config.record_dataset_repo_id}, "
+            f"num_episodes={self.config.record_num_episodes}"
+        )
+        self.logger.info("Keyboard controls: RIGHT=save episode, LEFT=rerecord episode, ESC=stop recording")
 
     def start(self):
         """Start the robot client and connect to the policy server"""
@@ -174,6 +248,20 @@ class RobotClient:
         """Stop the robot client"""
         self.shutdown_event.set()
 
+        # Finalize recording dataset before disconnecting
+        if self.dataset is not None:
+            try:
+                if self._video_encoding_manager is not None:
+                    self._video_encoding_manager.__exit__(None, None, None)
+                self.dataset.finalize()
+                self.logger.info(f"Dataset finalized at: {self.dataset.root}")
+            except Exception as e:
+                self.logger.warning(f"Dataset finalize error (non-fatal): {e}")
+
+        # Stop keyboard listener
+        if self._listener is not None:
+            self._listener.stop()
+
         self.robot.disconnect()
         self.logger.debug("Robot disconnected")
 
@@ -192,6 +280,9 @@ class RobotClient:
         if not isinstance(obs, TimedObservation):
             raise ValueError("Input observation needs to be a TimedObservation!")
 
+        if self._is_backing_off():
+            return False
+
         start_time = time.perf_counter()
         observation_bytes = pickle.dumps(obs)
         serialize_time = time.perf_counter() - start_time
@@ -208,10 +299,11 @@ class RobotClient:
             obs_timestep = obs.get_timestep()
             self.logger.debug(f"Sent observation #{obs_timestep} | ")
 
+            self._record_success()
             return True
 
-        except grpc.RpcError as e:
-            self.logger.error(f"Error sending observation #{obs.get_timestep()}: {e}")
+        except grpc.RpcError:
+            self._record_failure()
             return False
 
     def _inspect_action_queue(self):
@@ -273,6 +365,10 @@ class RobotClient:
         self.logger.info("Action receiving thread starting")
 
         while self.running:
+            if self._is_backing_off():
+                time.sleep(1.0)
+                continue
+
             try:
                 # Use StreamActions to get a stream of actions from the server
                 actions_chunk = self.stub.GetActions(services_pb2.Empty())
@@ -355,13 +451,33 @@ class RobotClient:
                         f"After: {new_size} items | "
                     )
 
-            except grpc.RpcError as e:
-                self.logger.error(f"Error receiving actions: {e}")
+            except grpc.RpcError:
+                self._record_failure()
 
     def actions_available(self):
         """Check if there are actions available in the queue"""
         with self.action_queue_lock:
             return not self.action_queue.empty()
+
+    def _is_backing_off(self) -> bool:
+        """Check if we're currently in a backoff period."""
+        return time.time() < self._backoff_until
+
+    def _record_failure(self) -> None:
+        """Record a connection failure and increase backoff duration."""
+        if self._backoff_duration == 0.0:
+            self._backoff_duration = 1.0
+        else:
+            self._backoff_duration = min(self._backoff_duration * 2, 30.0)
+        self._backoff_until = time.time() + self._backoff_duration
+        self.logger.warning(f"Server unavailable, backing off for {self._backoff_duration:.1f}s")
+
+    def _record_success(self) -> None:
+        """Reset backoff state on successful communication."""
+        if self._backoff_duration > 0.0:
+            self.logger.info("Server connection restored")
+        self._backoff_duration = 0.0
+        self._backoff_until = 0.0
 
     def _action_tensor_to_action_dict(self, action_tensor: torch.Tensor) -> dict[str, float]:
         action = {key: action_tensor[i].item() for i, key in enumerate(self.robot.action_features)}
@@ -378,11 +494,24 @@ class RobotClient:
             timed_action = self.action_queue.get_nowait()
         get_end = time.perf_counter() - get_start
 
-        _performed_action = self.robot.send_action(
-            self._action_tensor_to_action_dict(timed_action.get_action())
-        )
+        try:
+            _performed_action = self.robot.send_action(
+                self._action_tensor_to_action_dict(timed_action.get_action())
+            )
+        except ConnectionError as e:
+            self.logger.error(f"Robot connection lost: {e}. Stopping control loop.")
+            self.shutdown_event.set()
+            raise
+
         with self.latest_action_lock:
             self.latest_action = timed_action.get_timestep()
+
+        # Record frame (observation + action) to dataset
+        if self.dataset is not None and self._last_obs_processed is not None:
+            try:
+                self._record_frame(_performed_action)
+            except Exception as e:
+                self.logger.warning(f"Recording error (non-fatal): {e}")
 
         if verbose:
             with self.action_queue_lock:
@@ -405,13 +534,20 @@ class RobotClient:
         with self.action_queue_lock:
             return self.action_queue.qsize() / self.action_chunk_size <= self._chunk_size_threshold
 
-    def control_loop_observation(self, task: str, verbose: bool = False) -> RawObservation:
+    def control_loop_observation(
+        self, task: str, verbose: bool = False, raw_observation: RawObservation | None = None
+    ) -> RawObservation:
         try:
             # Get serialized observation bytes from the function
             start_time = time.perf_counter()
 
-            raw_observation: RawObservation = self.robot.get_observation()
-            raw_observation["task"] = task
+            if raw_observation is None:
+                raw_observation = self.robot.get_observation()
+                raw_observation["task"] = task
+
+            # Store observation for recording (reuse official processor)
+            if self.dataset is None:
+                self._last_obs_processed = self._robot_observation_processor(raw_observation)
 
             with self.latest_action_lock:
                 latest_action = self.latest_action
@@ -455,6 +591,18 @@ class RobotClient:
         except Exception as e:
             self.logger.error(f"Error in observation sender: {e}")
 
+    def _record_frame(self, performed_action: dict[str, Any]):
+        """Record a single frame (observation + action) to the dataset.
+
+        Reuses the official build_dataset_frame from lerobot-record.
+        """
+        observation_frame = self._build_dataset_frame(
+            self.dataset.features, self._last_obs_processed, prefix=self._OBS_STR
+        )
+        action_frame = self._build_dataset_frame(self.dataset.features, performed_action, prefix=self._ACTION)
+        frame = {**observation_frame, **action_frame, "task": self.config.task}
+        self.dataset.add_frame(frame)
+
     def control_loop(self, task: str, verbose: bool = False) -> tuple[Observation, Action]:
         """Combined function for executing actions and streaming observations"""
         # Wait at barrier for synchronized start
@@ -463,16 +611,83 @@ class RobotClient:
 
         _performed_action = None
         _captured_observation = None
+        recorded_episodes = 0
 
         while self.running:
             control_loop_start = time.perf_counter()
+
+            # Slow down loop when server is unavailable
+            if self._is_backing_off():
+                time.sleep(1.0)
+                continue
+
+            """Control loop: (0) Capture camera frame once per iteration for recording & server"""
+            _send_to_server = self._ready_to_send_observation()
+            _raw_obs = None
+            if self.dataset is not None or _send_to_server:
+                try:
+                    _raw_obs = self.robot.get_observation()
+                    _raw_obs["task"] = task
+                    # Store for recording
+                    if self.dataset is not None:
+                        self._last_obs_processed = self._robot_observation_processor(_raw_obs)
+                except Exception as e:
+                    self.logger.warning(f"Observation capture error (non-fatal): {e}")
+                    _raw_obs = None
+
             """Control loop: (1) Performing actions, when available"""
             if self.actions_available():
                 _performed_action = self.control_loop_action(verbose)
 
             """Control loop: (2) Streaming observations to the remote policy server"""
-            if self._ready_to_send_observation():
-                _captured_observation = self.control_loop_observation(task, verbose)
+            if _send_to_server and _raw_obs is not None:
+                _captured_observation = self.control_loop_observation(task, verbose, raw_observation=_raw_obs)
+
+            """Control loop: (3) Recording episode management via keyboard"""
+            if self.dataset is not None and self._events is not None and self._events["exit_early"]:
+                self._events["exit_early"] = False
+                if self._events.get("rerecord_episode", False):
+                    # Left arrow: discard current episode and re-record
+                    self._events["rerecord_episode"] = False
+                    try:
+                        self.dataset.clear_episode_buffer()
+                        self.logger.info("Episode discarded, re-recording...")
+                    except Exception as e:
+                        self.logger.warning(f"Clear episode error (non-fatal): {e}")
+                else:
+                    # Right arrow: save current episode
+                    try:
+                        self.dataset.save_episode()
+                        recorded_episodes += 1
+                        self.logger.info(
+                            f"Episode saved. Total: {recorded_episodes}/{self.config.record_num_episodes}"
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Episode save error (non-fatal): {e}")
+
+                if self._events.get("stop_recording", False):
+                    # Escape: stop recording but keep control loop running
+                    self._events["stop_recording"] = False
+                    try:
+                        if self._video_encoding_manager is not None:
+                            self._video_encoding_manager.__exit__(None, None, None)
+                        self.dataset.finalize()
+                        self.logger.info(f"Recording stopped. Dataset finalized at: {self.dataset.root}")
+                    except Exception as e:
+                        self.logger.warning(f"Dataset finalize error (non-fatal): {e}")
+                    self.dataset = None
+
+            # Check if target episodes reached
+            if self.dataset is not None and recorded_episodes >= self.config.record_num_episodes:
+                self.logger.info(f"Target episodes reached ({recorded_episodes}). Stopping recording.")
+                try:
+                    if self._video_encoding_manager is not None:
+                        self._video_encoding_manager.__exit__(None, None, None)
+                    self.dataset.finalize()
+                    self.logger.info(f"Dataset finalized at: {self.dataset.root}")
+                except Exception as e:
+                    self.logger.warning(f"Dataset finalize error (non-fatal): {e}")
+                self.dataset = None
 
             self.logger.debug(f"Control loop (ms): {(time.perf_counter() - control_loop_start) * 1000:.2f}")
             # Dynamically adjust sleep time to maintain the desired control frequency

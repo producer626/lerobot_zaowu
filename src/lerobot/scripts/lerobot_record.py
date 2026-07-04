@@ -494,6 +494,11 @@ def record(
                     dataset.clear_episode_buffer()
                     continue
 
+                if not dataset.has_pending_frames():
+                    logging.info("Skipping empty episode (no frames recorded)")
+                    dataset.clear_episode_buffer()
+                    continue
+
                 dataset.save_episode()
                 recorded_episodes += 1
     finally:
@@ -512,7 +517,10 @@ def record(
 
         if cfg.dataset.push_to_hub:
             if dataset and dataset.num_episodes > 0:
-                dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+                try:
+                    dataset.push_to_hub(tags=cfg.dataset.tags, private=cfg.dataset.private)
+                except Exception as e:
+                    logging.exception(f"Failed to push dataset to Hub: {e}")
             else:
                 logging.warning("No episodes saved — skipping push to hub")
 
