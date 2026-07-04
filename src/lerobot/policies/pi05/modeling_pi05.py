@@ -1147,7 +1147,7 @@ class PI05Policy(PreTrainedPolicy):
             return self.parameters()
 
         # Layer-wise learning rates for Task Adapter (Exp2)
-        adapter_names = ['action_in_proj', 'action_out_proj']
+        adapter_names = ["action_in_proj", "action_out_proj"]
         adapter_params, expert_params = [], []
         for name, param in self.named_parameters():
             if not param.requires_grad:
