@@ -176,3 +176,24 @@ outputs/
 *.urdf
 *.xml
 *.part
+
+# Media files (README assets, videos, images)
+media/
+
+# Large model/data files
+*.safetensors
+*.pth
+*.arrow
+*.parquet
+*.pkl
+*.bin
+*.h5
+*.onnx
+*.pt
+*.ckpt
+*.mp4
+*.avi
+*.webp
+
+# CI/CD workflows (fork 中不需要)
+.github/workflows/
