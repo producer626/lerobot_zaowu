@@ -559,6 +559,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             ignore_patterns.append("videos/")
 
         import os
+
         all_proxy = os.environ.pop("ALL_PROXY", None)
         all_proxy_lower = os.environ.pop("all_proxy", None)
         try:
@@ -604,7 +605,7 @@ class LeRobotDataset(torch.utils.data.Dataset):
             if all_proxy is not None:
                 os.environ["ALL_PROXY"] = all_proxy
             if all_proxy_lower is not None:
-                os.environ["all_proxy"] = all_proxy_lower
+                os.environ["all_proxy"] = all_proxy_lower  # noqa: SIM112
 
     def _download(self, download_videos: bool = True) -> None:
         """Downloads the dataset from the given 'repo_id' at the provided version."""

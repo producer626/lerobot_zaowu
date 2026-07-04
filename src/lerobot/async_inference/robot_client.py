@@ -45,7 +45,6 @@ from typing import Any
 
 import draccus
 import grpc
-import numpy as np
 import torch
 
 from lerobot.cameras.opencv import OpenCVCameraConfig  # noqa: F401
@@ -159,16 +158,21 @@ class RobotClient:
 
     def _setup_recording(self):
         """Set up dataset recording using the same flow as lerobot-record."""
+        from lerobot.common.control_utils import init_keyboard_listener
         from lerobot.datasets import LeRobotDataset
-        from lerobot.datasets.pipeline_features import aggregate_pipeline_dataset_features, create_initial_features
+        from lerobot.datasets.pipeline_features import (
+            aggregate_pipeline_dataset_features,
+            create_initial_features,
+        )
         from lerobot.datasets.video_utils import VideoEncodingManager
         from lerobot.processor.factory import make_default_processors
         from lerobot.utils.constants import ACTION, OBS_STR
         from lerobot.utils.feature_utils import build_dataset_frame, combine_feature_dicts
-        from lerobot.common.control_utils import init_keyboard_listener
 
         # Reuse official processor and feature construction (lerobot_record.py:451-466)
-        teleop_action_processor, robot_action_processor, robot_observation_processor = make_default_processors()
+        teleop_action_processor, robot_action_processor, robot_observation_processor = (
+            make_default_processors()
+        )
         self._robot_observation_processor = robot_observation_processor
         self._build_dataset_frame = build_dataset_frame
         self._OBS_STR = OBS_STR
@@ -208,9 +212,7 @@ class RobotClient:
             f"Recording enabled: repo_id={self.config.record_dataset_repo_id}, "
             f"num_episodes={self.config.record_num_episodes}"
         )
-        self.logger.info(
-            "Keyboard controls: RIGHT=save episode, LEFT=rerecord episode, ESC=stop recording"
-        )
+        self.logger.info("Keyboard controls: RIGHT=save episode, LEFT=rerecord episode, ESC=stop recording")
 
     def start(self):
         """Start the robot client and connect to the policy server"""
@@ -300,7 +302,7 @@ class RobotClient:
             self._record_success()
             return True
 
-        except grpc.RpcError as e:
+        except grpc.RpcError:
             self._record_failure()
             return False
 
@@ -449,7 +451,7 @@ class RobotClient:
                         f"After: {new_size} items | "
                     )
 
-            except grpc.RpcError as e:
+            except grpc.RpcError:
                 self._record_failure()
 
     def actions_available(self):
@@ -468,9 +470,7 @@ class RobotClient:
         else:
             self._backoff_duration = min(self._backoff_duration * 2, 30.0)
         self._backoff_until = time.time() + self._backoff_duration
-        self.logger.warning(
-            f"Server unavailable, backing off for {self._backoff_duration:.1f}s"
-        )
+        self.logger.warning(f"Server unavailable, backing off for {self._backoff_duration:.1f}s")
 
     def _record_success(self) -> None:
         """Reset backoff state on successful communication."""
@@ -599,9 +599,7 @@ class RobotClient:
         observation_frame = self._build_dataset_frame(
             self.dataset.features, self._last_obs_processed, prefix=self._OBS_STR
         )
-        action_frame = self._build_dataset_frame(
-            self.dataset.features, performed_action, prefix=self._ACTION
-        )
+        action_frame = self._build_dataset_frame(self.dataset.features, performed_action, prefix=self._ACTION)
         frame = {**observation_frame, **action_frame, "task": self.config.task}
         self.dataset.add_frame(frame)
 
@@ -646,39 +644,38 @@ class RobotClient:
                 _captured_observation = self.control_loop_observation(task, verbose, raw_observation=_raw_obs)
 
             """Control loop: (3) Recording episode management via keyboard"""
-            if self.dataset is not None and self._events is not None:
-                if self._events["exit_early"]:
-                    self._events["exit_early"] = False
-                    if self._events.get("rerecord_episode", False):
-                        # Left arrow: discard current episode and re-record
-                        self._events["rerecord_episode"] = False
-                        try:
-                            self.dataset.clear_episode_buffer()
-                            self.logger.info("Episode discarded, re-recording...")
-                        except Exception as e:
-                            self.logger.warning(f"Clear episode error (non-fatal): {e}")
-                    else:
-                        # Right arrow: save current episode
-                        try:
-                            self.dataset.save_episode()
-                            recorded_episodes += 1
-                            self.logger.info(
-                                f"Episode saved. Total: {recorded_episodes}/{self.config.record_num_episodes}"
-                            )
-                        except Exception as e:
-                            self.logger.warning(f"Episode save error (non-fatal): {e}")
+            if self.dataset is not None and self._events is not None and self._events["exit_early"]:
+                self._events["exit_early"] = False
+                if self._events.get("rerecord_episode", False):
+                    # Left arrow: discard current episode and re-record
+                    self._events["rerecord_episode"] = False
+                    try:
+                        self.dataset.clear_episode_buffer()
+                        self.logger.info("Episode discarded, re-recording...")
+                    except Exception as e:
+                        self.logger.warning(f"Clear episode error (non-fatal): {e}")
+                else:
+                    # Right arrow: save current episode
+                    try:
+                        self.dataset.save_episode()
+                        recorded_episodes += 1
+                        self.logger.info(
+                            f"Episode saved. Total: {recorded_episodes}/{self.config.record_num_episodes}"
+                        )
+                    except Exception as e:
+                        self.logger.warning(f"Episode save error (non-fatal): {e}")
 
-                    if self._events.get("stop_recording", False):
-                        # Escape: stop recording but keep control loop running
-                        self._events["stop_recording"] = False
-                        try:
-                            if self._video_encoding_manager is not None:
-                                self._video_encoding_manager.__exit__(None, None, None)
-                            self.dataset.finalize()
-                            self.logger.info(f"Recording stopped. Dataset finalized at: {self.dataset.root}")
-                        except Exception as e:
-                            self.logger.warning(f"Dataset finalize error (non-fatal): {e}")
-                        self.dataset = None
+                if self._events.get("stop_recording", False):
+                    # Escape: stop recording but keep control loop running
+                    self._events["stop_recording"] = False
+                    try:
+                        if self._video_encoding_manager is not None:
+                            self._video_encoding_manager.__exit__(None, None, None)
+                        self.dataset.finalize()
+                        self.logger.info(f"Recording stopped. Dataset finalized at: {self.dataset.root}")
+                    except Exception as e:
+                        self.logger.warning(f"Dataset finalize error (non-fatal): {e}")
+                    self.dataset = None
 
             # Check if target episodes reached
             if self.dataset is not None and recorded_episodes >= self.config.record_num_episodes:
