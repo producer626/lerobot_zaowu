@@ -558,44 +558,53 @@ class LeRobotDataset(torch.utils.data.Dataset):
         if not push_videos:
             ignore_patterns.append("videos/")
 
-        hub_api = HfApi()
-        hub_api.create_repo(
-            repo_id=self.repo_id,
-            private=private,
-            repo_type="dataset",
-            exist_ok=True,
-        )
-        if branch:
-            hub_api.create_branch(
+        import os
+        all_proxy = os.environ.pop("ALL_PROXY", None)
+        all_proxy_lower = os.environ.pop("all_proxy", None)
+        try:
+            hub_api = HfApi()
+            hub_api.create_repo(
                 repo_id=self.repo_id,
-                branch=branch,
-                revision=self.revision,
+                private=private,
                 repo_type="dataset",
                 exist_ok=True,
             )
+            if branch:
+                hub_api.create_branch(
+                    repo_id=self.repo_id,
+                    branch=branch,
+                    revision=self.revision,
+                    repo_type="dataset",
+                    exist_ok=True,
+                )
 
-        upload_kwargs = {
-            "repo_id": self.repo_id,
-            "folder_path": self.root,
-            "repo_type": "dataset",
-            "revision": branch,
-            "allow_patterns": allow_patterns,
-            "ignore_patterns": ignore_patterns,
-        }
-        if upload_large_folder:
-            hub_api.upload_large_folder(**upload_kwargs)
-        else:
-            hub_api.upload_folder(**upload_kwargs)
+            upload_kwargs = {
+                "repo_id": self.repo_id,
+                "folder_path": self.root,
+                "repo_type": "dataset",
+                "revision": branch,
+                "allow_patterns": allow_patterns,
+                "ignore_patterns": ignore_patterns,
+            }
+            if upload_large_folder:
+                hub_api.upload_large_folder(**upload_kwargs)
+            else:
+                hub_api.upload_folder(**upload_kwargs)
 
-        card = create_lerobot_dataset_card(
-            tags=tags, dataset_info=self.meta.info, license=license, repo_id=self.repo_id, **card_kwargs
-        )
-        card.push_to_hub(repo_id=self.repo_id, repo_type="dataset", revision=branch)
+            card = create_lerobot_dataset_card(
+                tags=tags, dataset_info=self.meta.info, license=license, repo_id=self.repo_id, **card_kwargs
+            )
+            card.push_to_hub(repo_id=self.repo_id, repo_type="dataset", revision=branch)
 
-        if tag_version:
-            with contextlib.suppress(RevisionNotFoundError):
-                hub_api.delete_tag(self.repo_id, tag=CODEBASE_VERSION, repo_type="dataset")
-            hub_api.create_tag(self.repo_id, tag=CODEBASE_VERSION, revision=branch, repo_type="dataset")
+            if tag_version:
+                with contextlib.suppress(RevisionNotFoundError):
+                    hub_api.delete_tag(self.repo_id, tag=CODEBASE_VERSION, repo_type="dataset")
+                hub_api.create_tag(self.repo_id, tag=CODEBASE_VERSION, revision=branch, repo_type="dataset")
+        finally:
+            if all_proxy is not None:
+                os.environ["ALL_PROXY"] = all_proxy
+            if all_proxy_lower is not None:
+                os.environ["all_proxy"] = all_proxy_lower
 
     def _download(self, download_videos: bool = True) -> None:
         """Downloads the dataset from the given 'repo_id' at the provided version."""

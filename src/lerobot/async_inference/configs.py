@@ -148,6 +148,27 @@ class RobotClientConfig:
         default=False, metadata={"help": "Visualize the action queue size"}
     )
 
+    # Observation key renaming (for matching policy training camera names)
+    rename_map: dict[str, str] = field(
+        default_factory=dict,
+        metadata={
+            "help": "Mapping from robot observation keys to policy observation keys. "
+            "Example: {'observation.images.front': 'observation.images.camera1'}"
+        },
+    )
+
+    # Recording configuration
+    record_dataset_repo_id: str | None = field(
+        default=None,
+        metadata={"help": "Dataset repo_id to save recordings. None disables recording."},
+    )
+    record_dataset_root: str | None = field(
+        default=None, metadata={"help": "Root directory for the recorded dataset"}
+    )
+    record_num_episodes: int = field(
+        default=10, metadata={"help": "Target number of episodes to record (controlled by keyboard)"}
+    )
+
     @property
     def environment_dt(self) -> float:
         """Environment time step, in seconds"""
@@ -200,4 +221,8 @@ class RobotClientConfig:
             "task": self.task,
             "debug_visualize_queue_size": self.debug_visualize_queue_size,
             "aggregate_fn_name": self.aggregate_fn_name,
+            "rename_map": self.rename_map,
+            "record_dataset_repo_id": self.record_dataset_repo_id,
+            "record_dataset_root": self.record_dataset_root,
+            "record_num_episodes": self.record_num_episodes,
         }
